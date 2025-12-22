@@ -81,6 +81,8 @@ func (s *Session) handle(cmd, arg string) error {
 			fmt.Fprintf(s.conn, " %s\r\n", str)
 		}
 		s.reply(211, "End")
+	case "SYST":
+		s.reply(215, "UNIX Type: L8")
 	case "PASV":
 		if !s.authed {
 			s.reply(530, "Login required.")
@@ -96,7 +98,7 @@ func (s *Session) handle(cmd, arg string) error {
 		}
 		return s.cmdList(arg)
 	case "PWD", "XPWD":
-		s.reply(257, s.cwd)
+		s.reply(257, fmt.Sprintf("\"%s\" is the current directory.", s.cwd))
 	case "CWD":
 		if !s.authed {
 			s.reply(530, "Login required.")
@@ -116,7 +118,6 @@ func (s *Session) handle(cmd, arg string) error {
 
 		s.cwd = cleanFtpPath(joinFtp(s.cwd, arg))
 		s.reply(250, "Directory changed.")
-
 		return nil
 	case "RETR":
 		if !s.authed {
@@ -139,7 +140,6 @@ func (s *Session) handle(cmd, arg string) error {
 		s.restOffset = int64(offset)
 		s.reply(350, "Restarting at specified bytes.")
 		return nil
-
 	case "SIZE":
 		if !s.authed {
 			s.reply(530, "Login required.")
