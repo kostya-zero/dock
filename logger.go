@@ -10,7 +10,7 @@ import (
 func PrepareLogger() *log.Logger {
 	return log.NewWithOptions(os.Stdout, log.Options{
 		ReportTimestamp: true,
-		TimeFormat:      time.Kitchen,
+		TimeFormat:      time.RFC1123,
 		ReportCaller:    true,
 	})
 }

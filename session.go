@@ -15,23 +15,24 @@ import (
 )
 
 type Session struct {
-	User          string
-	cwd           string
-	ActiveAddr    *net.TCPAddr
-	authed        bool
-	conn          net.Conn
-	server        *Server
-	restOffset    int64
-	logger        *log.Logger
-	pasvListeneer net.Listener
+	ID               string
+	User             string
+	currentDirectory string
+	ActiveAddr       *net.TCPAddr
+	authorized       bool
+	connection       net.Conn
+	server           *Server
+	restOffset       int64
+	logger           *log.Logger
+	pasvListeneer    net.Listener
 }
 
 func (s *Session) reply(code int, msg string) {
-	fmt.Fprintf(s.conn, "%d %s\r\n", code, msg)
+	fmt.Fprintf(s.connection, "%d %s\r\n", code, msg)
 }
 
 func (s *Session) handle(cmd, arg string) error {
-	l.Info("Received a new command", "command", cmd, "arg", arg)
+	l.Debug("Received command", "command", cmd, "arg", arg, "session", s.ID)
 
 	switch cmd {
 	case "OPTS":
@@ -56,7 +57,7 @@ func (s *Session) handle(cmd, arg string) error {
 		s.User = arg
 		s.reply(331, "Password is required.")
 	case "PORT":
-		if !s.authed {
+		if !s.authorized {
 			s.reply(530, "Login required.")
 			return nil
 		}
@@ -72,19 +73,20 @@ func (s *Session) handle(cmd, arg string) error {
 			return nil
 		}
 
-		s.authed = true
+		s.authorized = true
 		s.reply(230, "Login success.")
+		l.Info("User has been authenticated", "user", s.User, "session", s.ID)
 	case "FEAT":
 		features := [4]string{"UTF8", "MLST type*;size*;modify*;perm*;", "PASV", "PORT"}
 		s.reply(211, "Features")
 		for _, str := range features {
-			fmt.Fprintf(s.conn, " %s\r\n", str)
+			fmt.Fprintf(s.connection, " %s\r\n", str)
 		}
 		s.reply(211, "End")
 	case "SYST":
 		s.reply(215, "UNIX Type: L8")
 	case "PASV":
-		if !s.authed {
+		if !s.authorized {
 			s.reply(530, "Login required.")
 			return nil
 		}
@@ -92,15 +94,15 @@ func (s *Session) handle(cmd, arg string) error {
 	case "TYPE":
 		s.reply(200, "OK")
 	case "LIST", "NLST", "MLST", "MLSD":
-		if !s.authed {
+		if !s.authorized {
 			s.reply(530, "Login required.")
 			return nil
 		}
 		return s.cmdList(arg)
 	case "PWD", "XPWD":
-		s.reply(257, fmt.Sprintf("\"%s\" is the current directory.", s.cwd))
+		s.reply(257, fmt.Sprintf("\"%s\" is the current directory.", s.currentDirectory))
 	case "CWD":
-		if !s.authed {
+		if !s.authorized {
 			s.reply(530, "Login required.")
 			return nil
 		}
@@ -116,23 +118,23 @@ func (s *Session) handle(cmd, arg string) error {
 			return errors.New("not a directory")
 		}
 
-		s.cwd = cleanFtpPath(joinFtp(s.cwd, arg))
+		s.currentDirectory = cleanFtpPath(joinFtp(s.currentDirectory, arg))
 		s.reply(250, "Directory changed.")
 		return nil
 	case "RETR":
-		if !s.authed {
+		if !s.authorized {
 			s.reply(530, "Login required.")
 			return nil
 		}
 		return s.cmdRetr(arg)
 	case "STOR":
-		if !s.authed {
+		if !s.authorized {
 			s.reply(530, "Login required.")
 			return nil
 		}
 		return s.cmdStor(arg)
 	case "REST":
-		if !s.authed {
+		if !s.authorized {
 			s.reply(530, "Login required.")
 			return nil
 		}
@@ -147,7 +149,7 @@ func (s *Session) handle(cmd, arg string) error {
 		s.reply(350, "Restarting at specified bytes.")
 		return nil
 	case "SIZE":
-		if !s.authed {
+		if !s.authorized {
 			s.reply(530, "Login required.")
 			return nil
 		}
@@ -168,7 +170,7 @@ func (s *Session) handle(cmd, arg string) error {
 		return nil
 	case "QUIT":
 		s.reply(221, "Bye!")
-		_ = s.conn.Close()
+		_ = s.connection.Close()
 		return nil
 	}
 
@@ -219,7 +221,7 @@ func (s *Session) cmdRetr(arg string) error {
 		return errors.New("RETR requires filename")
 	}
 
-	p, err := s.absPath(joinFtp(s.cwd, arg))
+	p, err := s.absPath(joinFtp(s.currentDirectory, arg))
 	if err != nil {
 		return err
 	}
@@ -248,10 +250,12 @@ func (s *Session) cmdRetr(arg string) error {
 	defer data.Close()
 
 	s.reply(150, "Beginning transfer...")
+	l.Info("(RETR) User is retriving file.", "user", s.User, "session", s.ID, "file", p)
 	_, err = io.Copy(data, f)
 	if err != nil {
 		return err
 	}
+	l.Info("(RETR) User has finished transfer.", "user", s.User, "session", s.ID, "file", p)
 	s.reply(226, "Transfer finished")
 	return nil
 }
@@ -265,9 +269,9 @@ func (s *Session) cmdList(arg string) error {
 
 	s.reply(150, "Listing of directory")
 
-	dirPath := s.cwd
+	dirPath := s.currentDirectory
 	if strings.TrimSpace(arg) != "" {
-		dirPath = cleanFtpPath(joinFtp(s.cwd, arg))
+		dirPath = cleanFtpPath(joinFtp(s.currentDirectory, arg))
 	}
 
 	p, err := s.absPath(dirPath)
@@ -318,7 +322,7 @@ func (s *Session) cmdPasv() error {
 	s.pasvListeneer = ln
 
 	addr := ln.Addr().(*net.TCPAddr)
-	hostIP, ok := s.conn.LocalAddr().(*net.TCPAddr)
+	hostIP, ok := s.connection.LocalAddr().(*net.TCPAddr)
 	ipStr := ""
 	if ok && hostIP.IP != nil && hostIP.IP.To4() != nil && !hostIP.IP.IsUnspecified() {
 		ipStr = hostIP.IP.String()
@@ -341,7 +345,7 @@ func (s *Session) cmdStor(arg string) error {
 		return nil
 	}
 
-	p, err := s.absPath(joinFtp(s.cwd, arg))
+	p, err := s.absPath(joinFtp(s.currentDirectory, arg))
 	if err != nil {
 		return err
 	}
@@ -376,13 +380,14 @@ func (s *Session) cmdStor(arg string) error {
 	defer data.Close()
 
 	s.reply(150, "OK to send data.")
-
+	l.Info("(STOR) User is sending file.", "user", s.User, "session", s.ID, "file", p)
 	_, err = io.Copy(f, data)
 	if err != nil {
 		return err
 	}
 
 	s.restOffset = 0
+	l.Info("(STOR) User completed the transfer.", "user", s.User, "session", s.ID, "file", p)
 	s.reply(226, "Transfer complete.")
 	return nil
 }
@@ -433,7 +438,7 @@ func (s *Session) cmdPort(arg string) error {
 func (s *Session) absPath(ftpPath string) (string, error) {
 	full := ftpPath
 	if !strings.HasPrefix(full, "/") {
-		full = joinFtp(s.cwd, full)
+		full = joinFtp(s.currentDirectory, full)
 	}
 	full = cleanFtpPath(full)
 

@@ -3,10 +3,12 @@ package main
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 
 	"github.com/charmbracelet/log"
+	"github.com/google/uuid"
 )
 
 type Server struct {
@@ -20,13 +22,17 @@ var l *log.Logger
 func (s *Server) handleConn(c net.Conn) {
 	defer c.Close()
 
+	uuid := uuid.New().String()
 	session := &Session{
-		User:   "",
-		cwd:    "/",
-		authed: false,
-		conn:   c,
-		server: s,
+		ID:               uuid,
+		User:             "",
+		currentDirectory: "/",
+		authorized:       false,
+		connection:       c,
+		server:           s,
 	}
+
+	l.Info("New connection received.", "session", uuid, "ip", c.RemoteAddr().String())
 
 	session.reply(220, "Dock is welcoming you!")
 
@@ -44,7 +50,7 @@ func (s *Server) handleConn(c net.Conn) {
 		cmd = strings.ToUpper(cmd)
 
 		if err := session.handle(cmd, arg); err != nil {
-			l.Errorf("An error occured in session handler: %s", err.Error())
+			l.Error(fmt.Sprintf("An error occured in handler: %s", err.Error()), "session", uuid)
 		}
 	}
 }
@@ -73,7 +79,8 @@ func (s *Server) checkPassword(user, pass string) error {
 
 func StartServer(c *Config) error {
 	l = PrepareLogger()
-	l.Info("An FTP server is starting...")
+	l.Infof("Dock FTP Server %s", version)
+	l.Info("Starting...")
 	listener, err := net.Listen("tcp", c.Address)
 	if err != nil {
 		return err
