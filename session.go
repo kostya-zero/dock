@@ -125,6 +125,12 @@ func (s *Session) handle(cmd, arg string) error {
 			return nil
 		}
 		return s.cmdRetr(arg)
+	case "STOR":
+		if !s.authed {
+			s.reply(530, "Login required.")
+			return nil
+		}
+		return s.cmdStor(arg)
 	case "REST":
 		if !s.authed {
 			s.reply(530, "Login required.")
@@ -326,6 +332,58 @@ func (s *Session) cmdPasv() error {
 	h := strings.Split(ipStr, ".")
 	s.reply(227, fmt.Sprintf("Entering Passive Mode (%s,%s,%s,%s,%d,%d)", h[0], h[1], h[2], h[3], p1, p2))
 
+	return nil
+}
+
+func (s *Session) cmdStor(arg string) error {
+	if strings.TrimSpace(arg) == "" {
+		s.reply(501, "Invalid path for STOR")
+		return nil
+	}
+
+	p, err := s.absPath(joinFtp(s.cwd, arg))
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+
+	f, err := os.Create(p)
+	if err != nil {
+		s.reply(550, "Could not create file on remote host.")
+		return nil
+	}
+	defer f.Close()
+
+	info, _ := f.Stat()
+
+	if s.restOffset > 0 {
+		if s.restOffset >= info.Size() {
+			s.reply(550, "Invalid restart position.")
+			s.restOffset = 0
+			return nil
+		}
+		_, _ = f.Seek(s.restOffset, io.SeekStart)
+	}
+
+	data, err := s.openDataConnection()
+	if err != nil {
+		s.reply(425, "Can't open data connection.")
+		return nil
+	}
+	defer data.Close()
+
+	s.reply(150, "OK to send data.")
+
+	_, err = io.Copy(f, data)
+	if err != nil {
+		return err
+	}
+
+	s.restOffset = 0
+	s.reply(226, "Transfer complete.")
 	return nil
 }
 
