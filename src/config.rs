@@ -3,11 +3,31 @@ use std::{collections::HashMap, fs};
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub address: String,
     pub users: HashMap<String, String>,
     pub root: String,
+}
+
+#[derive(Debug)]
+pub enum ConfigError {
+    UserNotFound,
+    WrongPasswor,
+}
+
+impl Config {
+    pub fn check_user(&self, username: &String) -> bool {
+        self.users.contains_key(username)
+    }
+
+    pub fn check_password(&self, username: &String, password: &String) -> bool {
+        if let Some(pass) = self.users.get(username) {
+            pass == password
+        } else {
+            false
+        }
+    }
 }
 
 pub fn load_config(path: &str) -> Result<Config> {
