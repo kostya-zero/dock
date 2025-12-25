@@ -142,7 +142,7 @@ impl Session {
         Ok(data.to_string())
     }
 
-    async fn split_data(&self, data: String) -> Option<(String, String)> {
+    fn split_data(&self, data: String) -> Option<(String, String)> {
         let trimmed = data.trim_end();
         let splitted = trimmed
             .splitn(2, ' ')
@@ -189,7 +189,7 @@ impl Session {
         self.reply(220, "Dock is welcoming you!").await?;
         loop {
             let data = self.receive().await?;
-            let (cmd, arg) = if let Some((c, a)) = self.split_data(data).await {
+            let (cmd, arg) = if let Some((c, a)) = self.split_data(data) {
                 (c, a)
             } else {
                 continue;
@@ -253,18 +253,19 @@ impl Session {
                     reply_ok!(self, 501, "Path is required");
                 }
 
-                let temp_cwd = self.current_dir.join(arg);
-                let temp_cwd_string = temp_cwd.to_string_lossy().to_string();
-                let trimmed_temp_cwd = temp_cwd_string.trim_start_matches("/");
-                let real_path = PathBuf::from(&self.config.root).join(trimmed_temp_cwd);
-                if !real_path.exists() {
-                    reply_ok!(self, 550, "Path does not exist.");
-                }
+                let new_virtual = self.current_dir.join(&arg).to_string_lossy().to_string();
+                let real_path = match self.resolve_path(new_virtual.clone()) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        reply_ok!(self, 550, "Failed to change directory.");
+                    }
+                };
+
                 if !real_path.is_dir() {
                     reply_ok!(self, 550, "Not a directory.");
                 }
 
-                self.current_dir = temp_cwd;
+                self.current_dir = PathBuf::from(new_virtual);
                 reply!(self, 250, "Directory changed.");
             }
             Commands::Option => {
@@ -289,9 +290,19 @@ impl Session {
                     .map_err(|e| ConnectionError::DataConnectionFailed(e.to_string()))?;
                 reply!(self, 150, "Listing of directory");
 
-                let cwd = self.current_dir.to_string_lossy().to_string();
-                let trimmed_cwd = cwd.trim_start_matches("/");
-                let real_path = Path::new(&self.config.root).join(trimmed_cwd);
+                let virtual_path = if arg.is_empty() {
+                    self.current_dir.to_string_lossy().to_string()
+                } else {
+                    self.current_dir.join(&arg).to_string_lossy().to_string()
+                };
+
+                let real_path = match self.resolve_path(virtual_path) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        reply!(self, 550, "Failed to list directory.");
+                        return Ok(());
+                    }
+                };
 
                 // Pseudo values. I dont think clients really care about it.
                 let links = "1";
@@ -371,28 +382,26 @@ impl Session {
             }
             Commands::Size => {
                 require_authorization!(self);
-
                 if arg.is_empty() {
                     reply_ok!(self, 501, "Path is required");
                 }
 
-                let temp_path = self.current_dir.join(arg);
-                let temp_path_string = temp_path.to_string_lossy().to_string();
-                let trimmed_temp_path = temp_path_string.trim_start_matches("/");
-                let real_path = PathBuf::from(&self.config.root).join(trimmed_temp_path);
-                if !real_path.exists() {
-                    reply_ok!(self, 550, "Path does not exist.");
-                }
-                if !real_path.is_file() {
-                    reply_ok!(self, 550, "Not a file.");
-                }
+                let virtual_path = self.current_dir.join(&arg).to_string_lossy().to_string();
+                let real_path = match self.resolve_path(virtual_path) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        reply!(self, 550, "File unavailable.");
+                        return Ok(());
+                    }
+                };
 
                 let metadata = fs::metadata(real_path)
                     .await
                     .map_err(|_| ConnectionError::FileSystemError)?;
-                let size = metadata.len();
-
-                reply!(self, 213, format!("{}", size).as_str());
+                if !metadata.is_file() {
+                    reply_ok!(self, 550, "Not a file.");
+                }
+                reply!(self, 213, format!("{}", metadata.len()).as_str());
             }
             Commands::ChangeDirectoryUp => {
                 require_authorization!(self);
@@ -422,27 +431,28 @@ impl Session {
                 let h3 = splitted[2].trim();
                 let h4 = splitted[3].trim();
 
-                let p1: usize = splitted[4].trim().parse().unwrap();
-                if p1 > 255 {
-                    reply_ok!(self, 501, "Invalid port.");
+                if let (Ok(p1), Ok(p2)) = (
+                    splitted[4].trim().parse::<u16>(),
+                    splitted[5].trim().parse::<u16>(),
+                ) {
+                    if p1 > 255 || p2 > 255 {
+                        reply_ok!(self, 501, "Invalid port");
+                    }
+
+                    let port = p1 * 256 + p2;
+                    let ip_string = format!("{h1}.{h2}.{h3}.{h4}:{port}");
+                    let addr: SocketAddr = ip_string.parse().unwrap();
+
+                    if let Some(pasv) = self.passive_listener.take() {
+                        drop(pasv);
+                        self.passive_listener = None;
+                    }
+
+                    self.active_addr = Some(addr);
+                    reply!(self, 200, "PORT command success.");
+                } else {
+                    reply!(self, 501, "Syntax error in arguments ");
                 }
-
-                let p2: usize = splitted[5].trim().parse().unwrap();
-                if p2 > 255 {
-                    reply_ok!(self, 501, "Invalid port.");
-                }
-
-                let port = p1 * 256 + p2;
-                let ip_string = format!("{h1}.{h2}.{h3}.{h4}:{port}");
-                let addr: SocketAddr = ip_string.parse().unwrap();
-
-                if let Some(pasv) = self.passive_listener.take() {
-                    drop(pasv);
-                    self.passive_listener = None;
-                }
-
-                self.active_addr = Some(addr);
-                reply!(self, 200, "PORT command success.");
             }
             Commands::Passive => {
                 require_authorization!(self);
@@ -500,12 +510,15 @@ impl Session {
                     reply_ok!(self, 501, "Argument is required.");
                 }
 
-                let real_path = self.get_real_path().await;
-                let file_path = real_path.join(arg);
-                if !file_path.exists() {
-                    reply_ok!(self, 550, "File not found.");
-                }
-                let mut file = File::open(&file_path)
+                let virtual_path = self.current_dir.join(&arg).to_string_lossy().to_string();
+                let real_path = match self.resolve_path(virtual_path) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        reply!(self, 550, "File unavailable.");
+                        return Ok(());
+                    }
+                };
+                let mut file = File::open(&real_path)
                     .await
                     .map_err(|_| ConnectionError::FileSystemError)?;
                 let meta = file
@@ -526,11 +539,12 @@ impl Session {
 
                 if let Ok(mut data) = self.open_data_connection().await {
                     reply!(self, 150, "Ready to transfer...");
-                    info!(session_id=%self.id, file=%file_path.to_string_lossy() , username=%self.username, "User is retriving file.");
+                    info!(session_id=%self.id, file=%real_path.to_string_lossy() , username=%self.username, "User is retriving file.");
                     io::copy(&mut file, &mut data).await.map_err(|_| {
                         ConnectionError::DataConnectionFailed(String::from("I/O operation failed"))
                     })?;
                     let _ = data.shutdown().await;
+                    self.rest_offset = 0;
                     reply!(self, 226, "Done.");
                 } else {
                     reply!(self, 425, "Cant open data connection.");
@@ -551,8 +565,7 @@ impl Session {
                     reply_ok!(self, 553, "File name not allowed.");
                 }
 
-                let real_path = self.get_real_path().await;
-                let file_path = real_path.join(arg);
+                let file_path = self.get_real_path().join(arg);
                 let parent_dir = file_path.parent().unwrap_or(Path::new(""));
                 fs::create_dir_all(parent_dir)
                     .await
@@ -561,17 +574,19 @@ impl Session {
                     .await
                     .map_err(|_| ConnectionError::FileSystemError)?;
 
-                let mut data = self
-                    .open_data_connection()
-                    .await
-                    .map_err(|e| ConnectionError::DataConnectionFailed(e.to_string()))?;
+                if let Ok(mut data) = self.open_data_connection().await {
+                    reply!(self, 150, "Ready to receive.");
+                    info!(session_id=%self.id, file=%file_path.to_string_lossy() , username=%self.username, "User is sending file.");
+                    io::copy(&mut data, &mut file).await.map_err(|_| {
+                        ConnectionError::DataConnectionFailed(String::from("I/O operation failed"))
+                    })?;
 
-                io::copy(&mut data, &mut file).await.map_err(|_| {
-                    ConnectionError::DataConnectionFailed(String::from("I/O operation failed"))
-                })?;
-
-                let _ = data.shutdown().await;
-                reply!(self, 226, "Transfer complete.");
+                    self.rest_offset = 0;
+                    let _ = data.shutdown().await;
+                    reply!(self, 226, "Transfer complete.");
+                } else {
+                    reply!(self, 425, "Cant open data connection.");
+                }
             }
         }
         Ok(())
@@ -611,11 +626,23 @@ impl Session {
         &self.id
     }
 
-    async fn get_real_path(&mut self) -> PathBuf {
+    fn get_real_path(&mut self) -> PathBuf {
         let temp_cwd = &self.current_dir;
         let temp_cwd_string = temp_cwd.to_string_lossy().to_string();
         let temp_cwd_trimmed = temp_cwd_string.trim_start_matches('/');
         Path::new(&self.config.root).join(temp_cwd_trimmed)
+    }
+
+    fn resolve_path(&self, path: String) -> Result<PathBuf, ConnectionError> {
+        let root = Path::new(&self.config.root);
+        let candidate = root.join(path.strip_prefix("/").unwrap_or(&path));
+        let canon = candidate
+            .canonicalize()
+            .map_err(|_| ConnectionError::FileSystemError)?;
+        if !canon.starts_with(root) {
+            return Err(ConnectionError::FileSystemError); // or custom Permission error
+        }
+        Ok(canon)
     }
 }
 
