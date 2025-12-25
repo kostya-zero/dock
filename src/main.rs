@@ -1,7 +1,7 @@
 use std::process::exit;
 
 use clap::Parser;
-use dock::{cli::Cli, config::load_config};
+use dock::{cli::Cli, config::load_config, server::Server};
 
 #[tokio::main]
 async fn main() {
@@ -14,4 +14,7 @@ async fn main() {
             exit(1);
         }
     };
+
+    let server = Server::new(config);
+    server.start_server().await;
 }

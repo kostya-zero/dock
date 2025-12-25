@@ -4,7 +4,10 @@ use anyhow::{Result, anyhow};
 use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::{config::Config, session::Session};
+use crate::{
+    config::Config,
+    session::{ConnectionError, Session},
+};
 
 pub struct Server {
     config: Config,
@@ -20,6 +23,7 @@ impl Server {
             .await
             .map_err(|_| anyhow!("failed to bind to given address"))?;
         info!("Listening on {}", self.config.address);
+        println!("Starting dock");
 
         let arc_config = Arc::new(self.config.clone());
 
@@ -37,7 +41,11 @@ impl Server {
                 let mut session =
                     Session::new(&session_id, addr, socket, (*arc_config_cloned).clone());
                 if let Err(e) = session.run_session().await {
-                    eprintln!("session failed ({session_id}): {e}");
+                    if e == ConnectionError::ClosedByQuit {
+                        println!("session was closed by user ({session_id})");
+                    } else {
+                        eprintln!("session failed ({session_id}): {e}");
+                    }
                 }
             });
         }
