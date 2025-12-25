@@ -21,6 +21,7 @@ use tracing::info;
 use crate::{commands::Commands, config::Config};
 
 const SERVER_FEATURES: [&str; 4] = ["UTF8", "MLST type*;size*;modify*;perm*;", "PASV", "PORT"];
+const DISALLOWED_FILENAMES: [&str; 2] = ["..", "."];
 
 macro_rules! reply {
     ($self:expr, $code:expr, $message:expr) => {
@@ -202,8 +203,12 @@ impl Session {
     async fn handle_command(&mut self, cmd: Commands, arg: String) -> Result<(), ConnectionError> {
         match cmd {
             Commands::User => {
+                if self.authorized {
+                    reply_ok!(self, 230, "Already logged in.");
+                }
+
                 if arg.is_empty() {
-                    reply_ok!(self, 510, "Username is required.");
+                    reply_ok!(self, 501, "Username is required.");
                 }
 
                 if !self.config.check_user(&arg) {
@@ -215,11 +220,11 @@ impl Session {
             }
             Commands::Password => {
                 if self.username.is_empty() {
-                    reply_ok!(self, 510, "Username is required.");
+                    reply_ok!(self, 501, "Username is required.");
                 }
 
                 if arg.is_empty() {
-                    reply_ok!(self, 510, "Password is required");
+                    reply_ok!(self, 501, "Password is required");
                 }
 
                 if !self.config.check_password(&self.username, &arg) {
@@ -245,7 +250,7 @@ impl Session {
                 require_authorization!(self);
 
                 if arg.is_empty() {
-                    reply_ok!(self, 530, "Path is required");
+                    reply_ok!(self, 501, "Path is required");
                 }
 
                 let temp_cwd = self.current_dir.join(arg);
@@ -253,10 +258,10 @@ impl Session {
                 let trimmed_temp_cwd = temp_cwd_string.trim_start_matches("/");
                 let real_path = PathBuf::from(&self.config.root).join(trimmed_temp_cwd);
                 if !real_path.exists() {
-                    reply_ok!(self, 530, "Path does not exist.");
+                    reply_ok!(self, 550, "Path does not exist.");
                 }
                 if !real_path.is_dir() {
-                    reply_ok!(self, 530, "Not a directory.");
+                    reply_ok!(self, 550, "Not a directory.");
                 }
 
                 self.current_dir = temp_cwd;
@@ -272,7 +277,7 @@ impl Session {
                         reply!(self, 200, "UTF-8 is enabled by default.");
                     }
                     _ => {
-                        reply!(self, 530, "Unknown option");
+                        reply!(self, 501, "Unknown option");
                     }
                 }
             }
@@ -356,7 +361,7 @@ impl Session {
                 reply!(self, 211, "End");
             }
             Commands::Unknown => {
-                reply!(self, 501, "Unknown command.");
+                reply!(self, 502, "Unknown command.");
             }
             Commands::System => {
                 reply!(self, 215, "UNIX Type: L8");
@@ -487,8 +492,12 @@ impl Session {
             Commands::Retrive => {
                 require_authorization!(self);
 
+                if !self.config.can_user_read(&self.username) {
+                    reply_ok!(self, 501, "No permission to read.");
+                }
+
                 if arg.is_empty() {
-                    reply_ok!(self, 550, "Argument is required.");
+                    reply_ok!(self, 501, "Argument is required.");
                 }
 
                 let real_path = self.get_real_path().await;
@@ -515,23 +524,31 @@ impl Session {
                         .map_err(|_| ConnectionError::FileSystemError)?;
                 }
 
-                let mut data = self
-                    .open_data_connection()
-                    .await
-                    .map_err(|e| ConnectionError::DataConnectionFailed(e.to_string()))?;
-                reply!(self, 150, "Ready to transfer...");
-                info!(session_id=%self.id, file=%file_path.to_string_lossy() , username=%self.username, "User is retriving file.");
-                io::copy(&mut file, &mut data).await.map_err(|_| {
-                    ConnectionError::DataConnectionFailed(String::from("I/O operation failed"))
-                })?;
-                let _ = data.shutdown().await;
-                reply!(self, 226, "Done.");
+                if let Ok(mut data) = self.open_data_connection().await {
+                    reply!(self, 150, "Ready to transfer...");
+                    info!(session_id=%self.id, file=%file_path.to_string_lossy() , username=%self.username, "User is retriving file.");
+                    io::copy(&mut file, &mut data).await.map_err(|_| {
+                        ConnectionError::DataConnectionFailed(String::from("I/O operation failed"))
+                    })?;
+                    let _ = data.shutdown().await;
+                    reply!(self, 226, "Done.");
+                } else {
+                    reply!(self, 425, "Cant open data connection.");
+                }
             }
             Commands::Store => {
                 require_authorization!(self);
 
+                if !self.config.can_user_write(&self.username) {
+                    reply_ok!(self, 550, "No permission to write.");
+                }
+
                 if arg.is_empty() {
-                    reply_ok!(self, 550, "Argument is required.");
+                    reply_ok!(self, 501, "Argument is required.");
+                }
+
+                if DISALLOWED_FILENAMES.contains(&arg.as_str()) {
+                    reply_ok!(self, 553, "File name not allowed.");
                 }
 
                 let real_path = self.get_real_path().await;
