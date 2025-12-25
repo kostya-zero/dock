@@ -639,9 +639,17 @@ impl Session {
         let canon = candidate
             .canonicalize()
             .map_err(|_| ConnectionError::FileSystemError)?;
+
+        #[cfg(unix)]
         if !canon.starts_with(root) {
-            return Err(ConnectionError::FileSystemError); // or custom Permission error
+            return Err(ConnectionError::FileSystemError);
         }
+        #[cfg(not(unix))]
+        let canon_format = format!("\\\\?\\{}", root.to_string_lossy());
+        if !canon.starts_with(canon_format) {
+            return Err(ConnectionError::FileSystemError);
+        }
+
         Ok(canon)
     }
 }
