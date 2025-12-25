@@ -11,8 +11,8 @@ use std::os::unix::fs::PermissionsExt;
 use anyhow::{Result, anyhow, bail};
 use thiserror::Error;
 use tokio::{
-    fs,
-    io::{AsyncReadExt, AsyncWriteExt},
+    fs::{self, File},
+    io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
     net::{TcpListener, TcpStream},
     time,
 };
@@ -70,8 +70,7 @@ pub struct Session {
     authorized: bool,
     current_dir: PathBuf,
     connection: TcpStream,
-    #[allow(dead_code)]
-    address: SocketAddr,
+    rest_offset: u64,
     active_addr: Option<SocketAddr>,
     passive_listener: Option<TcpListener>,
     config: Config,
@@ -79,12 +78,12 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(id: &String, address: SocketAddr, connection: TcpStream, config: Config) -> Self {
+    pub fn new(id: &String, connection: TcpStream, config: Config) -> Self {
         Self {
             id: id.to_owned(),
-            address,
             connection,
             config,
+            rest_offset: 0,
             active_addr: None,
             passive_listener: None,
             current_dir: PathBuf::from("/"),
@@ -346,7 +345,7 @@ impl Session {
                         .map_err(|e| ConnectionError::WriteError(e.to_string()))?;
                 }
 
-                drop(data_connection);
+                let _ = data_connection.shutdown().await;
                 reply!(self, 226, "Transfer complete.");
             }
             Commands::Quit => {
@@ -360,12 +359,50 @@ impl Session {
                 }
                 reply!(self, 211, "End");
             }
-            Commands::Unknown => todo!(),
+            Commands::Unknown => {
+                reply!(self, 501, "Unknown command.");
+            }
             Commands::System => {
                 reply!(self, 215, "UNIX Type: L8");
             }
             Commands::Type => {
                 reply!(self, 200, "OK");
+            }
+            Commands::Size => {
+                require_authorization!(self);
+
+                if arg.is_empty() {
+                    reply_ok!(self, 501, "Path is required");
+                }
+
+                let temp_path = self.current_dir.join(arg);
+                let temp_path_string = temp_path.to_string_lossy().to_string();
+                let trimmed_temp_path = temp_path_string.trim_start_matches("/");
+                let real_path = PathBuf::from(&self.config.root).join(trimmed_temp_path);
+                if !real_path.exists() {
+                    reply_ok!(self, 550, "Path does not exist.");
+                }
+                if !real_path.is_file() {
+                    reply_ok!(self, 550, "Not a file.");
+                }
+
+                let metadata = fs::metadata(real_path)
+                    .await
+                    .map_err(|_| ConnectionError::FileSystemError)?;
+                let size = metadata.len();
+
+                reply!(self, 213, format!("{}", size).as_str());
+            }
+            Commands::ChangeDirectoryUp => {
+                require_authorization!(self);
+
+                let parent = if let Some(p) = self.current_dir.parent() {
+                    p.to_path_buf()
+                } else {
+                    PathBuf::from("/")
+                };
+                self.current_dir = parent;
+                reply!(self, 250, "Directory changed.");
             }
             Commands::Port => {
                 require_authorization!(self);
@@ -441,6 +478,90 @@ impl Session {
                     .as_str()
                 );
             }
+            Commands::Rest => {
+                require_authorization!(self);
+
+                if arg.is_empty() {
+                    reply_ok!(self, 501, "Argument is required.");
+                }
+
+                self.rest_offset = arg.parse().unwrap();
+                reply!(self, 350, "Restarting at sepcific bytes.");
+            }
+            Commands::Retrive => {
+                require_authorization!(self);
+
+                if arg.is_empty() {
+                    reply_ok!(self, 550, "Argument is required.");
+                }
+
+                let real_path = self.get_real_path().await;
+                let file_path = real_path.join(arg);
+                if !file_path.exists() {
+                    reply_ok!(self, 550, "File not found.");
+                }
+                let mut file = File::open(file_path)
+                    .await
+                    .map_err(|_| ConnectionError::FileSystemError)?;
+                let meta = file
+                    .metadata()
+                    .await
+                    .map_err(|_| ConnectionError::FileSystemError)?;
+                let size = meta.len();
+
+                if self.rest_offset > 0 {
+                    if self.rest_offset >= size {
+                        self.rest_offset = 0;
+                        reply_ok!(self, 550, "Invalid restart position.");
+                    }
+                    file.seek(SeekFrom::Start(self.rest_offset))
+                        .await
+                        .map_err(|_| ConnectionError::FileSystemError)?;
+                }
+
+                let mut data = self
+                    .open_data_connection()
+                    .await
+                    .map_err(|e| ConnectionError::DataConnectionFailed(e.to_string()))?;
+                reply!(self, 150, "Ready to transfer...");
+                io::copy(&mut file, &mut data).await.map_err(|_| {
+                    ConnectionError::DataConnectionFailed(String::from("I/O operation failed"))
+                })?;
+                let _ = data.shutdown().await;
+                reply!(self, 226, "Done.");
+            }
+            Commands::Store => {
+                require_authorization!(self);
+
+                if arg.is_empty() {
+                    reply_ok!(self, 550, "Argument is required.");
+                }
+
+                let real_path = self.get_real_path().await;
+                let file_path = real_path.join(arg);
+                let parent_dir = file_path.parent().unwrap_or(Path::new(""));
+                println!("making dirs.");
+                fs::create_dir_all(parent_dir)
+                    .await
+                    .map_err(|_| ConnectionError::FileSystemError)?;
+                println!("openning file.");
+                let mut file = File::create(&file_path)
+                    .await
+                    .map_err(|_| ConnectionError::FileSystemError)?;
+
+                println!("writing to file.");
+                let mut data = self
+                    .open_data_connection()
+                    .await
+                    .map_err(|e| ConnectionError::DataConnectionFailed(e.to_string()))?;
+
+                io::copy(&mut data, &mut file).await.map_err(|_| {
+                    ConnectionError::DataConnectionFailed(String::from("I/O operation failed"))
+                })?;
+
+                let _ = data.shutdown().await;
+                reply!(self, 226, "Transfer complete.");
+            }
         }
         Ok(())
     }
@@ -477,6 +598,13 @@ impl Session {
 
     pub fn id(&self) -> &String {
         &self.id
+    }
+
+    async fn get_real_path(&mut self) -> PathBuf {
+        let temp_cwd = &self.current_dir;
+        let temp_cwd_string = temp_cwd.to_string_lossy().to_string();
+        let temp_cwd_trimmed = temp_cwd_string.trim_start_matches('/');
+        Path::new(&self.config.root).join(temp_cwd_trimmed)
     }
 }
 

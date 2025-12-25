@@ -38,8 +38,7 @@ impl Server {
 
             tokio::spawn(async move {
                 let session_id = cuid2::cuid();
-                let mut session =
-                    Session::new(&session_id, addr, socket, (*arc_config_cloned).clone());
+                let mut session = Session::new(&session_id, socket, (*arc_config_cloned).clone());
                 if let Err(e) = session.run_session().await {
                     if e == ConnectionError::ClosedByQuit {
                         println!("session was closed by user ({session_id})");

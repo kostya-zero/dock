@@ -16,5 +16,7 @@ async fn main() {
     };
 
     let server = Server::new(config);
-    server.start_server().await;
+    if let Err(e) = server.start_server().await {
+        eprintln!("Server error occurred: {e}");
+    }
 }
