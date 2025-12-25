@@ -16,6 +16,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     time,
 };
+use tracing::info;
 
 use crate::{commands::Commands, config::Config};
 
@@ -130,13 +131,11 @@ impl Session {
 
     async fn receive(&mut self) -> Result<String, ConnectionError> {
         let mut buf = [0u8; 1024];
-        println!("waiting for data");
         let n = match self.connection.read(&mut buf).await {
             Ok(0) => return Err(ConnectionError::Disconnected),
             Ok(n) => n,
             Err(e) => return Err(ConnectionError::ReadFailed(e.to_string())),
         };
-        println!("Received data");
         let data = String::from_utf8_lossy(&buf[..n]);
 
         Ok(data.to_string())
@@ -188,16 +187,12 @@ impl Session {
     pub async fn run_session(&mut self) -> Result<(), ConnectionError> {
         self.reply(220, "Dock is welcoming you!").await?;
         loop {
-            println!("Starting");
             let data = self.receive().await?;
             let (cmd, arg) = if let Some((c, a)) = self.split_data(data).await {
                 (c, a)
             } else {
-                eprintln!("bad format.");
                 continue;
             };
-
-            println!("Received command: {cmd}");
 
             let command: Commands = cmd.into();
             self.handle_command(command, arg).await?;
@@ -232,6 +227,7 @@ impl Session {
                 }
 
                 self.authorized = true;
+                info!(session_id=%self.id, username=%self.username, "User authorized.");
                 reply!(self, 230, "Login success.");
             }
             Commands::WorkingDir => {
@@ -500,7 +496,7 @@ impl Session {
                 if !file_path.exists() {
                     reply_ok!(self, 550, "File not found.");
                 }
-                let mut file = File::open(file_path)
+                let mut file = File::open(&file_path)
                     .await
                     .map_err(|_| ConnectionError::FileSystemError)?;
                 let meta = file
@@ -524,6 +520,7 @@ impl Session {
                     .await
                     .map_err(|e| ConnectionError::DataConnectionFailed(e.to_string()))?;
                 reply!(self, 150, "Ready to transfer...");
+                info!(session_id=%self.id, file=%file_path.to_string_lossy() , username=%self.username, "User is retriving file.");
                 io::copy(&mut file, &mut data).await.map_err(|_| {
                     ConnectionError::DataConnectionFailed(String::from("I/O operation failed"))
                 })?;
@@ -540,16 +537,13 @@ impl Session {
                 let real_path = self.get_real_path().await;
                 let file_path = real_path.join(arg);
                 let parent_dir = file_path.parent().unwrap_or(Path::new(""));
-                println!("making dirs.");
                 fs::create_dir_all(parent_dir)
                     .await
                     .map_err(|_| ConnectionError::FileSystemError)?;
-                println!("openning file.");
                 let mut file = File::create(&file_path)
                     .await
                     .map_err(|_| ConnectionError::FileSystemError)?;
 
-                println!("writing to file.");
                 let mut data = self
                     .open_data_connection()
                     .await
