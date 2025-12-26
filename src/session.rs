@@ -514,8 +514,7 @@ impl Session {
                 let real_path = match self.resolve_path(virtual_path) {
                     Ok(p) => p,
                     Err(_) => {
-                        reply!(self, 550, "File unavailable.");
-                        return Ok(());
+                        reply_ok!(self, 550, "File unavailable.");
                     }
                 };
                 let mut file = File::open(&real_path)
@@ -645,9 +644,11 @@ impl Session {
             return Err(ConnectionError::FileSystemError);
         }
         #[cfg(not(unix))]
-        let canon_format = format!("\\\\?\\{}", root.to_string_lossy());
-        if !canon.starts_with(canon_format) {
-            return Err(ConnectionError::FileSystemError);
+        {
+            let canon_format = format!("\\\\?\\{}", root.to_string_lossy());
+            if !canon.starts_with(canon_format) {
+                return Err(ConnectionError::FileSystemError);
+            }
         }
 
         Ok(canon)
