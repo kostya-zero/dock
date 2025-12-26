@@ -53,10 +53,16 @@ impl Server {
                 let mut session = Session::new(&session_id, socket, (*arc_config_cloned).clone());
                 info!(session_id=%session_id, ip=%addr, "Initiated new session.");
                 if let Err(e) = session.run_session().await {
-                    if e == ConnectionError::ClosedByQuit {
-                        info!(session_id=%session_id, "Session was closed by user.");
-                    } else {
-                        error!(session_id=%session_id, reason=%e, "Session failed");
+                    match e {
+                        ConnectionError::ClosedByQuit => {
+                            info!(session_id=%session_id, "Session was closed by user.");
+                        }
+                        ConnectionError::Disconnected => {
+                            info!(session_id=%session_id, "Session was closed because user had disconnected.");
+                        }
+                        _ => {
+                            error!(session_id=%session_id, reason=%e, "Session failed.");
+                        }
                     }
                 }
             });
